@@ -33,7 +33,9 @@ use whatsapp_rust::upload::UploadOptions;
 use whatsapp_rust::wacore::download::{DownloadWriter, Downloadable};
 use whatsapp_rust::wacore::history_sync::{HistorySyncStream, MAX_DECOMPRESSED};
 use whatsapp_rust::wacore::iq::abprops;
+use whatsapp_rust::wacore::iq::usync::LidQuerySpec;
 use whatsapp_rust::wacore::store::DevicePropsOverride;
+use whatsapp_rust::wacore_binary::Server;
 use whatsapp_rust::wacore_binary::jid::JidExt;
 use whatsapp_rust::waproto::buffa::Message as _;
 use whatsapp_rust::{MediaRetryResult, MediaReuploadRequest};
@@ -79,6 +81,17 @@ const AVATAR_FRESH: Duration = Duration::from_secs(24 * 60 * 60);
 const PHONE_PATIENCE: Duration = Duration::from_secs(30);
 /// Phone history-request batch size.
 const PHONE_BATCH: i32 = 50;
+/// How long a live message may wait for the server to name the phone number
+/// behind a privacy id. A mapping the library already persisted answers
+/// instantly; only an identity it has never seen needs the round trip.
+const LID_RESOLVE_WAIT: Duration = Duration::from_secs(3);
+/// How long the connection-time repair waits for one batch of privacy ids.
+const LID_REPAIR_WAIT: Duration = Duration::from_secs(30);
+/// Privacy ids per usync query. The server answers each user in the batch.
+const LID_QUERY_BATCH: usize = 50;
+/// A failed lookup is not repeated for this long, so one offline identity
+/// cannot delay every message or app-state update that names it.
+const LID_RETRY_AFTER: Duration = Duration::from_secs(10 * 60);
 /// `HistorySync.sync_type` for on-demand history responses.
 const ON_DEMAND: i32 = 6;
 /// Maximum attachment-preview dimension.
@@ -863,6 +876,8 @@ pub async fn run(
         me_name: None,
         me_about: None,
         lid_to_pn: HashMap::new(),
+        lid_unresolved: HashMap::new(),
+        lid_generation: 0,
         contacts: HashMap::new(),
         status: LinkStatus::Starting,
         pairing_phone: None,
@@ -992,6 +1007,12 @@ pub async fn run(
                     online,
                     succeeded,
                 } => worker.presence_sent(generation, online, succeeded),
+                RuntimeEvent::LidResolved {
+                    generation,
+                    lid,
+                    pn,
+                    hosted,
+                } => worker.lid_resolved(generation, &lid, &pn, hosted),
             },
             Some(event) = async {
                 match call_events.as_mut() {
@@ -1060,6 +1081,23 @@ enum RuntimeEvent {
         generation: u64,
         complete: bool,
     },
+    /// A connection-time privacy-id repair found the phone number.
+    LidResolved {
+        generation: u64,
+        lid: String,
+        pn: String,
+        hosted: bool,
+    },
+}
+
+/// A fresh usync request id for one privacy-id lookup. The counter keeps two
+/// lookups in the same second apart.
+fn lid_query_sid() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let now = crate::util::now();
+    let count = NEXT.fetch_add(1, Ordering::Relaxed);
+    format!("ZAPFAST{now}{count}")
 }
 
 /// Renames an archive whose key is gone, with its SQLite side files, and
@@ -1276,6 +1314,11 @@ struct Worker {
     me_about: Option<String>,
     /// Privacy-id user part to phone-number user part.
     lid_to_pn: HashMap<String, String>,
+    /// Privacy-id chats the server could not resolve this session, with the
+    /// time of the attempt. Cleared when the link changes.
+    lid_unresolved: HashMap<String, Instant>,
+    /// Invalidates connection-time repair results from an older session.
+    lid_generation: u64,
     contacts: HashMap<String, Contact>,
     status: LinkStatus,
     pairing_phone: Option<String>,
@@ -3038,14 +3081,34 @@ impl Worker {
 
     // --- ids -------------------------------------------------------------
 
+    /// A privacy id in either namespace, with its phone-number namespace.
+    fn pn_chat(pn: &str, lid_server: Server) -> String {
+        let server = if lid_server == Server::HostedLid {
+            Server::Hosted
+        } else {
+            Server::Pn
+        };
+        Jid::new(pn, server).to_non_ad_string()
+    }
+
     fn learn_lid(&mut self, lid: &str, pn: &str) {
+        self.learn_lid_on(lid, pn, Server::Lid, Server::Pn);
+    }
+
+    /// Remembers a privacy id mapping and merges a chat already filed under it.
+    /// A mapping the archive knows still merges a stale row, which is how an
+    /// archive left with both spellings is repaired on connection.
+    fn learn_lid_on(&mut self, lid: &str, pn: &str, lid_server: Server, pn_server: Server) {
         if lid.is_empty() || pn.is_empty() {
             return;
         }
-        if self.lid_to_pn.get(lid).is_some_and(|known| known == pn) {
+        let lid_chat = Jid::new(lid, lid_server).to_non_ad_string();
+        let chat = Jid::new(pn, pn_server).to_non_ad_string();
+        let known = self.lid_to_pn.get(lid).is_some_and(|known| known == pn);
+        if known && self.archive.chat(&lid_chat).ok().flatten().is_none() {
             return;
         }
-        let changed = match self.archive.put_lid(lid, pn) {
+        let changed = match self.archive.put_lid_chat(&lid_chat, &chat, lid, pn) {
             Ok(changed) => changed,
             Err(error) => {
                 log::warn!("could not remember an id mapping: {error}");
@@ -3053,11 +3116,10 @@ impl Worker {
             }
         };
         self.lid_to_pn.insert(lid.to_owned(), pn.to_owned());
+        self.lid_unresolved.remove(&lid_chat);
         if changed {
             self.emit_chats();
         }
-        let chat = format!("{pn}@s.whatsapp.net");
-        let lid_chat = format!("{lid}@lid");
         match self.archive.removed_message_ids(&chat) {
             Ok(ids) => {
                 for id in ids {
@@ -3090,11 +3152,14 @@ impl Worker {
     }
 
     fn learn_pair(&mut self, a: &Jid, b: &Jid) {
-        if a.is_lid() && b.is_pn() {
-            self.learn_lid(a.user_base(), b.user_base());
-        } else if a.is_pn() && b.is_lid() {
-            self.learn_lid(b.user_base(), a.user_base());
-        }
+        let (lid, pn) = if a.server.is_lid_family() && b.server.is_pn_family() {
+            (a, b)
+        } else if b.server.is_lid_family() && a.server.is_pn_family() {
+            (b, a)
+        } else {
+            return;
+        };
+        self.learn_lid_on(lid.user_base(), pn.user_base(), lid.server, pn.server);
     }
 
     fn learn_source(&mut self, source: &MessageSource) {
@@ -3111,12 +3176,241 @@ impl Worker {
         }
     }
 
+    /// Learns the pairs a source carries, then asks the server for the
+    /// phone-number side of any privacy id still unknown. Whatsapp-rust does
+    /// not fill `recipient_alt` from `peer_recipient_pn`, so a from-me echo
+    /// can name only the peer's LID; resolving it here files the message in
+    /// the phone-number chat instead of creating a second "Unknown" row.
+    async fn resolve_sources<'a>(&mut self, sources: impl IntoIterator<Item = &'a MessageSource>) {
+        let sources: Vec<&MessageSource> = sources.into_iter().collect();
+        for source in &sources {
+            self.learn_source(source);
+        }
+        let mut jids = Vec::new();
+        for source in &sources {
+            for jid in [
+                Some(&source.chat),
+                Some(&source.sender),
+                source.recipient.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if jid.server.is_lid_family() {
+                    jids.push(jid.clone());
+                }
+            }
+        }
+        self.resolve_lid_batch(jids).await;
+    }
+
+    /// Resolves privacy ids through the library's persisted mapping first and
+    /// the server's usync second. A failure is remembered for a while so one
+    /// unresolved identity does not delay every later event that names it.
+    async fn resolve_lid_batch(&mut self, jids: impl IntoIterator<Item = Jid>) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let mut pending = Vec::new();
+        let mut seen = HashSet::new();
+        for jid in jids {
+            if !jid.server.is_lid_family() || self.lid_to_pn.contains_key(jid.user_base()) {
+                continue;
+            }
+            let id = jid.to_non_ad_string();
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            if self
+                .lid_unresolved
+                .get(&id)
+                .is_some_and(|at| at.elapsed() < LID_RETRY_AFTER)
+            {
+                continue;
+            }
+            // `get_lid_pn_entry` only accepts the plain LID server, while its
+            // cache and backend are keyed by the bare user part either way.
+            let lookup = Jid::lid(jid.user_base());
+            match client.get_lid_pn_entry(&lookup).await {
+                Ok(Some(entry)) => self.learn_lid_on(
+                    &entry.lid,
+                    &entry.phone_number,
+                    jid.server,
+                    if jid.server == Server::HostedLid {
+                        Server::Hosted
+                    } else {
+                        Server::Pn
+                    },
+                ),
+                Ok(None) => pending.push(jid),
+                Err(error) => {
+                    log::debug!("could not read a privacy mapping: {error}");
+                    pending.push(jid);
+                }
+            }
+        }
+        if pending.is_empty() {
+            return;
+        }
+        for chunk in pending.chunks(LID_QUERY_BATCH) {
+            let request = LidQuerySpec::new(chunk.to_vec(), lid_query_sid());
+            match tokio::time::timeout(LID_RESOLVE_WAIT, client.execute(request)).await {
+                Ok(Ok(response)) => {
+                    for mapping in &response.lid_mappings {
+                        let lid_server = chunk
+                            .iter()
+                            .find(|jid| jid.user_base() == mapping.lid.as_str())
+                            .map(|jid| jid.server)
+                            .unwrap_or(Server::Lid);
+                        self.learn_lid_on(
+                            &mapping.lid,
+                            &mapping.phone_number,
+                            lid_server,
+                            if lid_server == Server::HostedLid {
+                                Server::Hosted
+                            } else {
+                                Server::Pn
+                            },
+                        );
+                    }
+                    for jid in chunk {
+                        if !self.lid_to_pn.contains_key(jid.user_base()) {
+                            self.lid_unresolved
+                                .insert(jid.to_non_ad_string(), Instant::now());
+                        }
+                    }
+                }
+                Ok(Err(error)) => {
+                    log::debug!("privacy mapping lookup failed: {error}");
+                    for jid in chunk {
+                        self.lid_unresolved
+                            .insert(jid.to_non_ad_string(), Instant::now());
+                    }
+                }
+                Err(_) => {
+                    log::debug!("privacy mapping lookup timed out");
+                    for jid in chunk {
+                        self.lid_unresolved
+                            .insert(jid.to_non_ad_string(), Instant::now());
+                    }
+                    // One unanswered batch means the server is not answering
+                    // now; do not spend the same wait on the rest.
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Merges privacy-id chats already in the archive and asks the server for
+    /// the rest. Runs in the background: a connection must not wait on usync.
+    fn repair_lid_chats(&mut self) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let ids = match self.archive.lid_chats() {
+            Ok(ids) => ids,
+            Err(error) => {
+                log::warn!("could not list privacy-id chats: {error}");
+                return;
+            }
+        };
+        if ids.is_empty() {
+            return;
+        }
+        let generation = self.lid_generation;
+        let sender = self.wa_sender.clone();
+        let mut unresolved = Vec::new();
+        for id in &ids {
+            let Some(jid) = Self::jid_of(id) else {
+                continue;
+            };
+            let Some(pn) = self.lid_to_pn.get(jid.user_base()).cloned() else {
+                unresolved.push(jid);
+                continue;
+            };
+            // The archive already knew the pair; only the merge is missing.
+            self.learn_lid_on(
+                jid.user_base(),
+                &pn,
+                jid.server,
+                if jid.server == Server::HostedLid {
+                    Server::Hosted
+                } else {
+                    Server::Pn
+                },
+            );
+        }
+        if unresolved.is_empty() {
+            return;
+        }
+        tokio::spawn(async move {
+            let mut pending = Vec::new();
+            for jid in unresolved {
+                let lookup = Jid::lid(jid.user_base());
+                match client.get_lid_pn_entry(&lookup).await {
+                    Ok(Some(entry)) => {
+                        let _ = sender.send(RuntimeEvent::LidResolved {
+                            generation,
+                            lid: entry.lid.to_string(),
+                            pn: entry.phone_number.to_string(),
+                            hosted: jid.server == Server::HostedLid,
+                        });
+                    }
+                    Ok(None) => pending.push(jid),
+                    Err(error) => {
+                        log::debug!("could not read a privacy mapping: {error}");
+                        pending.push(jid);
+                    }
+                }
+            }
+            for chunk in pending.chunks(LID_QUERY_BATCH) {
+                let request = LidQuerySpec::new(chunk.to_vec(), lid_query_sid());
+                match tokio::time::timeout(LID_REPAIR_WAIT, client.execute(request)).await {
+                    Ok(Ok(response)) => {
+                        for mapping in &response.lid_mappings {
+                            let hosted = chunk
+                                .iter()
+                                .find(|jid| jid.user_base() == mapping.lid.as_str())
+                                .is_some_and(|jid| jid.server == Server::HostedLid);
+                            let _ = sender.send(RuntimeEvent::LidResolved {
+                                generation,
+                                lid: mapping.lid.to_string(),
+                                pn: mapping.phone_number.to_string(),
+                                hosted,
+                            });
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        log::debug!("privacy mapping repair failed: {error}");
+                    }
+                    Err(_) => {
+                        log::debug!("privacy mapping repair timed out");
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    /// Applies a repair answer only to the connection that asked for it.
+    fn lid_resolved(&mut self, generation: u64, lid: &str, pn: &str, hosted: bool) {
+        if generation != self.lid_generation {
+            return;
+        }
+        let (lid_server, pn_server) = if hosted {
+            (Server::HostedLid, Server::Hosted)
+        } else {
+            (Server::Lid, Server::Pn)
+        };
+        self.learn_lid_on(lid, pn, lid_server, pn_server);
+    }
+
     /// Returns the archive id for a JID, resolving known privacy ids.
     fn canonical(&self, jid: &Jid) -> String {
-        if jid.is_lid()
+        if jid.server.is_lid_family()
             && let Some(pn) = self.lid_to_pn.get(jid.user_base())
         {
-            let pn = format!("{pn}@s.whatsapp.net");
+            let pn = Self::pn_chat(pn, jid.server);
             return if self.is_me(&pn) { self.me() } else { pn };
         }
         let id = jid.to_non_ad_string();
@@ -3134,17 +3428,10 @@ impl Worker {
     }
 
     /// App-state mutations may use a privacy id before a message teaches the UI
-    /// its mapping. Consult the protocol library's persisted mapping as well.
+    /// its mapping. Resolve it rather than creating a second chat row.
     async fn canonical_sync_chat(&mut self, jid: &Jid) -> String {
-        if jid.is_lid()
-            && !self.lid_to_pn.contains_key(jid.user_base())
-            && let Some(client) = self.client.clone()
-        {
-            match client.get_lid_pn_entry(jid).await {
-                Ok(Some(entry)) => self.learn_lid(&entry.lid, &entry.phone_number),
-                Ok(None) => log::info!("chat removal: privacy mapping not yet available"),
-                Err(_) => log::warn!("chat removal: could not resolve privacy mapping"),
-            }
+        if jid.server.is_lid_family() {
+            self.resolve_lid_batch(std::iter::once(jid.clone())).await;
         }
         self.canonical(jid)
     }
@@ -3581,6 +3868,11 @@ impl Worker {
                 };
                 self.remember_identity(pn, lid, name);
                 self.set_status(LinkStatus::Connected);
+                // Retry identities the previous connection could not resolve,
+                // and merge privacy-id chats an older version left behind.
+                self.lid_unresolved.clear();
+                self.lid_generation = self.lid_generation.wrapping_add(1);
+                self.repair_lid_chats();
                 self.retry_message_removals();
                 // A new connection may reach a phone that was away before.
                 self.older_warned.clear();
@@ -3707,11 +3999,15 @@ impl Worker {
                 ));
             }
             E::Messages(batch) => {
+                self.resolve_sources(batch.messages.iter().map(|inbound| &inbound.info.source))
+                    .await;
                 for inbound in batch.messages.iter() {
                     self.ingest(&inbound.message, &inbound.info);
                 }
             }
             E::UndecryptableMessage(undecryptable) => {
+                self.resolve_sources(std::iter::once(&undecryptable.info.source))
+                    .await;
                 self.ingest_undecryptable(
                     &undecryptable.info,
                     undecryptable.unavailable_type,
@@ -3800,7 +4096,7 @@ impl Worker {
                 self.request_group_info(&chat, true);
             }
             E::ArchiveUpdate(update) => {
-                let chat = self.canonical(&update.jid);
+                let chat = self.canonical_sync_chat(&update.jid).await;
                 // The update can arrive before history creates the chat.
                 self.ensure_chat(&chat, None);
                 let _ = self.archive.set_archived_at(
@@ -3811,7 +4107,7 @@ impl Worker {
                 self.emit_chat(&chat);
             }
             E::PinUpdate(update) => {
-                let chat = self.canonical(&update.jid);
+                let chat = self.canonical_sync_chat(&update.jid).await;
                 self.ensure_chat(&chat, None);
                 let _ = self.archive.set_pinned_at(
                     &chat,
@@ -3821,7 +4117,7 @@ impl Worker {
                 self.emit_chat(&chat);
             }
             E::MuteUpdate(update) => {
-                let chat = self.canonical(&update.jid);
+                let chat = self.canonical_sync_chat(&update.jid).await;
                 // App state keeps mutes of channels long unfollowed, and a
                 // channel's own Mute comes from the server's list instead.
                 // Such a mute must not file an empty "Unknown" channel.
@@ -3844,7 +4140,7 @@ impl Worker {
             E::FavoritesUpdate(update) => self.favorite_chats_update(update),
             E::StarUpdate(update) => self.star_update(update),
             E::LockChatUpdate(update) => {
-                let chat = self.canonical(&update.jid);
+                let chat = self.canonical_sync_chat(&update.jid).await;
                 self.ensure_chat(&chat, None);
                 let locked = update.action.locked.unwrap_or(false);
                 let _ =
@@ -3883,7 +4179,7 @@ impl Worker {
                 self.delete_message_here(&update.chat_jid.to_string(), &update.message_id);
             }
             E::MarkChatAsReadUpdate(update) => {
-                let chat = self.canonical(&update.jid);
+                let chat = self.canonical_sync_chat(&update.jid).await;
                 self.ensure_chat(&chat, None);
                 if update.action.read.unwrap_or(true) {
                     let through = update
@@ -4057,6 +4353,8 @@ impl Worker {
             log::warn!("could not clear the archive: {error}");
         }
         self.lid_to_pn.clear();
+        self.lid_unresolved.clear();
+        self.lid_generation = self.lid_generation.wrapping_add(1);
         self.contacts.clear();
         self.group_info_requested.clear();
         self.group_info_queue.clear();
@@ -5469,6 +5767,47 @@ impl Worker {
 
     // --- history ---------------------------------------------------------
 
+    /// Learns every privacy-id pair the chunk carries before any chat is
+    /// canonicalized.
+    fn learn_history_pairs(&mut self, parsed: &ParsedHistory) {
+        for (lid, pn) in &parsed.lids {
+            if let (Some(lid), Some(pn)) = (Self::jid_of(lid), Self::jid_of(pn)) {
+                self.learn_pair(&lid, &pn);
+            }
+        }
+        for chat in &parsed.chats {
+            if let (Some(lid), Some(pn)) = (&chat.lid_jid, &chat.pn_jid)
+                && let (Some(lid), Some(pn)) = (Self::jid_of(lid), Self::jid_of(pn))
+            {
+                self.learn_pair(&lid, &pn);
+            }
+            // A conversation filed by its phone number can still name the
+            // privacy id separately, without a `pn_jid` of its own.
+            if let Some(lid) = &chat.lid_jid
+                && let Ok(lid) = lid.parse::<Jid>()
+                && lid.server.is_lid_family()
+                && let Ok(pn) = chat.id.parse::<Jid>()
+                && pn.server.is_pn_family()
+            {
+                self.learn_pair(&lid, &pn);
+            }
+        }
+    }
+
+    /// Chats the chunk names only by privacy id cannot be filed until their
+    /// phone number is known; ask once for the whole chunk.
+    async fn resolve_history_chats(&mut self, parsed: &ParsedHistory) {
+        let mut jids = Vec::new();
+        for chat in &parsed.chats {
+            if let Ok(jid) = chat.id.parse::<Jid>()
+                && jid.server.is_lid_family()
+            {
+                jids.push(jid);
+            }
+        }
+        self.resolve_lid_batch(jids).await;
+    }
+
     async fn on_history_sync(&mut self, lazy: &wa_events::LazyHistorySync) {
         // The id of the request an on-demand chunk answers.
         let session = lazy.peer_data_request_session_id().map(str::to_owned);
@@ -5511,6 +5850,8 @@ impl Worker {
                         );
                     }
                 }
+                self.learn_history_pairs(&parsed);
+                self.resolve_history_chats(&parsed).await;
                 let filed = self.apply_history(parsed, !on_demand);
                 if on_demand {
                     self.answer_older(filed, session.as_deref());
@@ -5540,11 +5881,7 @@ impl Worker {
         // Chats whose listed pictures, documents or links changed, told
         // once each rather than once per imported message.
         let mut media_changed_in: HashSet<ChatId> = HashSet::new();
-        for (lid, pn) in &parsed.lids {
-            if let (Some(lid), Some(pn)) = (Self::jid_of(lid), Self::jid_of(pn)) {
-                self.learn_pair(&lid, &pn);
-            }
-        }
+        self.learn_history_pairs(&parsed);
         if !parsed.stickers.is_empty() {
             log::info!(
                 "the phone listed {} recently used stickers",
@@ -5565,13 +5902,6 @@ impl Worker {
                 sticker.weight.unwrap_or(0.0),
             ) {
                 log::warn!("could not store a sticker");
-            }
-        }
-        for chat in &parsed.chats {
-            if let (Some(lid), Some(pn)) = (&chat.lid_jid, &chat.pn_jid)
-                && let (Some(lid), Some(pn)) = (Self::jid_of(lid), Self::jid_of(pn))
-            {
-                self.learn_pair(&lid, &pn);
             }
         }
         let mut filed = Vec::new();
@@ -6191,6 +6521,15 @@ impl Worker {
                 request.background = false;
                 self.prefetch.promote(&chat);
             }
+            return false;
+        }
+        // A chat filed under a privacy id has no phone number to ask about
+        // yet, and an empty one is the duplicate row an unresolved echo
+        // leaves behind. Never send an automatic request under that key.
+        if !explicit
+            && self.archive.oldest(&chat).ok().flatten().is_none()
+            && Self::jid_of(&chat).is_some_and(|jid| jid.server.is_lid_family())
+        {
             return false;
         }
         if self.archive.history_start(&chat).unwrap_or(false) {
@@ -18051,6 +18390,8 @@ mod receipt_tests {
             me_name: None,
             me_about: None,
             lid_to_pn: HashMap::new(),
+            lid_unresolved: HashMap::new(),
+            lid_generation: 0,
             contacts: HashMap::new(),
             status: LinkStatus::Connected,
             pairing_phone: None,
@@ -24160,5 +24501,222 @@ mod older_history_tests {
         worker.apply_history(history, true);
         worker.apply_history(chat_removal_tests::history(CHAT, &[90]), true);
         assert!(!worker.archive.history_start(CHAT).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod lid_identity_tests {
+    use super::*;
+
+    const ME: &str = "15550001111@s.whatsapp.net";
+    const PEER: &str = "4917663430455@s.whatsapp.net";
+    const PEER_LID_USER: &str = "167650256810092";
+    const PEER_LID: &str = "167650256810092@lid";
+    const HOSTED_LID_USER: &str = "100000000002";
+    const HOSTED_LID: &str = "100000000002@hosted.lid";
+    const HOSTED_PN: &str = "4915700000002@hosted";
+
+    /// A bot that only serves its persisted privacy-id table, never a socket.
+    async fn mapped_bot(lid: &str, pn: &str) -> (Bot, tempfile::TempDir) {
+        let directory = tempfile::tempdir().unwrap();
+        let store = whatsapp_rust::store::SqliteStore::open(
+            &directory.path().join("fixture.db").to_string_lossy(),
+        )
+        .await
+        .unwrap();
+        let bot = Bot::builder().with_backend(store).build().await.unwrap();
+        bot.client()
+            .add_lid_pn_mapping(
+                lid,
+                pn,
+                whatsapp_rust::wacore::types::lid_pn::LearningSource::Usync,
+            )
+            .await
+            .unwrap();
+        (bot, directory)
+    }
+
+    fn text_message(text: &str) -> Arc<wa::Message> {
+        let mut proto = wa::Message::default();
+        proto.conversation = Some(text.into());
+        Arc::new(proto)
+    }
+
+    fn echo(chat: &str, id: &str) -> MessageInfo {
+        MessageInfo {
+            id: id.into(),
+            source: MessageSource {
+                chat: chat.parse().unwrap(),
+                sender: ME.parse().unwrap(),
+                is_from_me: true,
+                ..Default::default()
+            },
+            timestamp: whatsapp_rust::wacore::time::from_secs(crate::util::now()).unwrap(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_message_naming_only_the_lid_lands_in_the_phone_chat() {
+        let (bot, _directory) = mapped_bot(PEER_LID_USER, "4917663430455").await;
+        let (mut worker, _events, _commands, _runtime) = receipt_tests::worker();
+        worker.client = Some(bot.client());
+        let info = echo(PEER_LID, "echo");
+
+        worker.resolve_sources(std::iter::once(&info.source)).await;
+        worker.ingest(&text_message("hello"), &info);
+
+        assert_eq!(
+            worker.canonical(&PEER_LID.parse().unwrap()),
+            PEER,
+            "the identity lookup must precede filing"
+        );
+        assert!(worker.archive.chat(PEER).unwrap().is_some());
+        assert!(
+            worker.archive.chat(PEER_LID).unwrap().is_none(),
+            "no second chat under the privacy id"
+        );
+        assert!(worker.archive.message(PEER, "echo").unwrap().is_some());
+        assert_eq!(
+            worker.lid_to_pn.get(PEER_LID_USER).map(String::as_str),
+            Some("4917663430455")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hosted_lid_is_canonicalized_to_its_hosted_phone_chat() {
+        let (bot, _directory) = mapped_bot(HOSTED_LID_USER, "4915700000002").await;
+        let (mut worker, _events, _commands, _runtime) = receipt_tests::worker();
+        worker.client = Some(bot.client());
+        let info = echo(HOSTED_LID, "hosted-echo");
+
+        worker.resolve_sources(std::iter::once(&info.source)).await;
+        worker.ingest(&text_message("hello from hosted"), &info);
+
+        assert_eq!(worker.canonical(&HOSTED_LID.parse().unwrap()), HOSTED_PN);
+        assert!(worker.archive.chat(HOSTED_PN).unwrap().is_some());
+        assert!(worker.archive.chat(HOSTED_LID).unwrap().is_none());
+        assert!(
+            worker
+                .archive
+                .message(HOSTED_PN, "hosted-echo")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_repair_merges_a_chat_left_under_an_unknown_lid() {
+        let (bot, _directory) = mapped_bot(PEER_LID_USER, "4917663430455").await;
+        let (mut worker, _events, _commands, mut runtime) = receipt_tests::worker();
+        worker.client = Some(bot.client());
+        worker.ensure_chat(PEER_LID, None);
+        worker
+            .archive
+            .insert_message(
+                &crate::archive::tests::message(PEER_LID, "old", 100, false),
+                None,
+            )
+            .unwrap();
+
+        worker.repair_lid_chats();
+        let answer = tokio::time::timeout(Duration::from_secs(2), runtime.recv())
+            .await
+            .expect("the repair answers")
+            .expect("the channel stays open");
+        let RuntimeEvent::LidResolved {
+            generation,
+            lid,
+            pn,
+            hosted,
+        } = answer
+        else {
+            panic!("expected a resolved privacy id");
+        };
+        assert!(!hosted);
+        worker.lid_resolved(generation, &lid, &pn, hosted);
+
+        assert!(worker.archive.chat(PEER).unwrap().is_some());
+        assert!(worker.archive.chat(PEER_LID).unwrap().is_none());
+        assert!(worker.archive.message(PEER, "old").unwrap().is_some());
+    }
+
+    #[test]
+    fn a_mapping_already_known_still_merges_its_stale_chat() {
+        let (mut worker, _events, _commands, _runtime) = receipt_tests::worker();
+        worker.ensure_chat(PEER_LID, None);
+        worker
+            .archive
+            .insert_message(
+                &crate::archive::tests::message(PEER_LID, "old", 100, false),
+                None,
+            )
+            .unwrap();
+        worker
+            .lid_to_pn
+            .insert(PEER_LID_USER.into(), "4917663430455".into());
+
+        worker.learn_lid(PEER_LID_USER, "4917663430455");
+
+        assert!(worker.archive.chat(PEER).unwrap().is_some());
+        assert!(worker.archive.chat(PEER_LID).unwrap().is_none());
+        assert!(worker.archive.message(PEER, "old").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn an_app_state_update_resolves_before_creating_the_chat() {
+        let (bot, _directory) = mapped_bot(PEER_LID_USER, "4917663430455").await;
+        let (mut worker, _events, _commands, _runtime) = receipt_tests::worker();
+        worker.client = Some(bot.client());
+        let update = wa_events::ArchiveUpdate::builder()
+            .jid(PEER_LID.parse().unwrap())
+            .timestamp(whatsapp_rust::wacore::time::now_utc())
+            .from_full_sync(false)
+            .action(Box::new({
+                let mut proto = wa::sync_action_value::ArchiveChatAction::default();
+                proto.archived = Some(true);
+                proto
+            }))
+            .build();
+        worker
+            .handle_wa_event(Arc::new(wa_events::Event::ArchiveUpdate(update)))
+            .await;
+
+        assert!(
+            worker.archive.chat(PEER_LID).unwrap().is_none(),
+            "the update must not file a second chat under the privacy id"
+        );
+        assert!(
+            worker
+                .archive
+                .chat(PEER)
+                .unwrap()
+                .expect("the phone chat")
+                .archived
+        );
+    }
+
+    #[test]
+    fn an_empty_privacy_chat_is_not_asked_about_automatically() {
+        let (mut worker, events, _commands, _runtime) = receipt_tests::worker();
+        worker.ensure_chat(PEER_LID, None);
+        while events.try_recv().is_ok() {}
+
+        assert!(!worker.fetch_older(PEER_LID.into(), false, false));
+        assert!(
+            events.try_recv().is_err(),
+            "an unresolved phantom chat must not start a history request"
+        );
+
+        // A reader who scrolls may still try; offline, that reports itself.
+        assert!(!worker.fetch_older(PEER_LID.into(), true, false));
+        assert!(matches!(
+            events.try_recv(),
+            Ok(Event::OlderFetched {
+                more: true,
+                silent: false,
+                ..
+            })
+        ));
     }
 }

@@ -5393,6 +5393,13 @@ impl App {
         let Some(conversation) = account.conversations.get_mut(chat) else {
             return;
         };
+        // An empty chat still filed under a privacy id is the duplicate row an
+        // unresolved echo leaves behind; its phone-number chat is the one to
+        // ask about, once the mapping arrives. A reader who scrolls may still
+        // try explicitly.
+        if !explicit && conversation.messages.is_empty() && crate::model::is_lid_chat(chat) {
+            return;
+        }
         if conversation.phone_exhausted {
             return;
         }

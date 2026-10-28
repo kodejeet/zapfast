@@ -548,6 +548,12 @@ pub fn phone_of(id: &str) -> Option<&str> {
     (server == "s.whatsapp.net" && user.chars().all(|c| c.is_ascii_digit())).then_some(user)
 }
 
+/// Whether a chat id is still a privacy id (`@lid` or `@hosted.lid`) rather
+/// than the phone-number chat it maps to.
+pub fn is_lid_chat(id: &str) -> bool {
+    matches!(id.rsplit_once('@'), Some((_, "lid" | "hosted.lid")))
+}
+
 /// Outgoing-message delivery state.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -3955,6 +3961,14 @@ mod tests {
         );
         assert_eq!(phone_of("12345@lid"), None);
         assert_eq!(phone_of("1-2@g.us"), None);
+    }
+
+    #[test]
+    fn privacy_ids_cover_both_namespaces() {
+        assert!(is_lid_chat("12345@lid"));
+        assert!(is_lid_chat("100000000001@hosted.lid"));
+        assert!(!is_lid_chat("393331234567@s.whatsapp.net"));
+        assert!(!is_lid_chat("12025550143@hosted"));
     }
 
     #[test]

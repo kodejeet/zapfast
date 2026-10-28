@@ -1092,11 +1092,26 @@ impl Archive {
     /// Stores a privacy id mapping and reconciles history already filed under
     /// the privacy id with the canonical phone-number chat.
     pub fn put_lid(&self, lid: &str, pn: &str) -> Result<bool> {
+        self.put_lid_chat(
+            &format!("{lid}@lid"),
+            &format!("{pn}@s.whatsapp.net"),
+            lid,
+            pn,
+        )
+    }
+
+    /// [`Self::put_lid`] for either privacy namespace: `@lid` merges into
+    /// `@s.whatsapp.net`, `@hosted.lid` into `@hosted`.
+    pub fn put_lid_chat(
+        &self,
+        lid_chat: &str,
+        phone_chat: &str,
+        lid: &str,
+        pn: &str,
+    ) -> Result<bool> {
         let transaction = self.connection.unchecked_transaction()?;
-        let lid_chat = format!("{lid}@lid");
-        let phone_chat = format!("{pn}@s.whatsapp.net");
-        Self::merge_group_recipient(&transaction, &lid_chat, &phone_chat)?;
-        let favorite = Self::move_favorite(&transaction, &lid_chat, &phone_chat)?;
+        Self::merge_group_recipient(&transaction, lid_chat, phone_chat)?;
+        let favorite = Self::move_favorite(&transaction, lid_chat, phone_chat)?;
         self.connection.execute(
             "INSERT INTO lids (lid, pn) VALUES (?1, ?2) ON CONFLICT(lid) DO UPDATE SET pn = excluded.pn",
             params![lid, pn],
@@ -1186,7 +1201,7 @@ impl Archive {
                 history_order = COALESCE(messages.history_order, excluded.history_order)",
             params![lid_chat, phone_chat],
         )?;
-        Self::move_message_metadata(&transaction, &lid_chat, &phone_chat)?;
+        Self::move_message_metadata(&transaction, lid_chat, phone_chat)?;
         transaction.execute(
             "INSERT OR IGNORE INTO polls (chat, id, creator, secret) SELECT ?2, id, creator, secret FROM polls WHERE chat = ?1",
             params![lid_chat, phone_chat],
@@ -1273,7 +1288,7 @@ impl Archive {
              WHERE id = ?4 AND EXISTS(SELECT 1 FROM chats WHERE id = ?1)",
             params![lid_chat, pn, phone_chat, phone_chat],
         )?;
-        self.purge_chat_rows(&lid_chat)?;
+        self.purge_chat_rows(lid_chat)?;
         transaction.execute("DELETE FROM chats WHERE id = ?1", params![lid_chat])?;
         transaction.commit()?;
         Ok(changed > 0 || favorite || removed > 0 || had_lid_chat)
@@ -1282,6 +1297,15 @@ impl Archive {
     pub fn lids(&self) -> Result<Vec<(String, String)>> {
         let mut statement = self.connection.prepare("SELECT lid, pn FROM lids")?;
         let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect()
+    }
+
+    /// Chats still filed under a privacy id, whichever namespace.
+    pub fn lid_chats(&self) -> Result<Vec<String>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT id FROM chats WHERE id LIKE '%@lid' OR id LIKE '%@hosted.lid'")?;
+        let rows = statement.query_map([], |row| row.get(0))?;
         rows.collect()
     }
 
@@ -4232,6 +4256,33 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert_eq!(ephemeral_timestamp, None);
+    }
+
+    #[test]
+    fn a_hosted_privacy_mapping_merges_into_the_hosted_phone_chat() {
+        let archive = Archive::in_memory().unwrap();
+        let lid = "9@hosted.lid";
+        let phone = "1@hosted";
+        archive.ensure_chat(lid, "Ada").unwrap();
+        archive
+            .insert_message(&message(lid, "from-hosted-lid", 100, false), None)
+            .unwrap();
+        assert_eq!(archive.lid_chats().unwrap(), [lid]);
+
+        assert!(archive.put_lid_chat(lid, phone, "9", "1").unwrap());
+
+        assert!(archive.chat(lid).unwrap().is_none());
+        assert_eq!(
+            archive
+                .messages(phone, None, 50)
+                .unwrap()
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            ["from-hosted-lid"]
+        );
+        assert_eq!(archive.lids().unwrap(), [("9".into(), "1".into())]);
+        assert_eq!(archive.lid_chats().unwrap(), Vec::<String>::new());
     }
 
     #[test]
